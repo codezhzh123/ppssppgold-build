@@ -1,0 +1,222 @@
+name: Build PPSSPP Gold
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Upstream PPSSPP branch or tag"
+        required: true
+        type: string
+        default: master
+      buildVariant:
+        description: "Android Build Variant"
+        required: true
+        type: choice
+        default: GoldRelease
+        options:
+          - GoldRelease
+          - GoldDebug
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows x64 Gold
+    runs-on: windows-latest
+
+    env:
+      BUILD_CONFIGURATION: Release
+      BUILD_PLATFORM: x64
+
+    steps:
+      - name: Checkout upstream source
+        uses: actions/checkout@v6
+        with:
+          repository: hrydgard/ppsspp
+          ref: ${{ inputs.version }}
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@30375c66a4eea26614e0d39710365f22f8b0af57
+
+      - name: Check Valid Version Tags
+        id: valid-tags
+        shell: bash
+        run: |
+          git fetch --deepen=15000 --no-recurse-submodules --tags || exit 0
+          echo "count=$(git tag -l 'v[0-9]*' | wc -l | tr -d ' ')" >> "$GITHUB_OUTPUT"
+
+      - name: Create git-version.cpp for Windows Gold
+        shell: pwsh
+        run: |
+          $GIT_VERSION = (git describe --always).Trim()
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to determine Git version"
+          }
+
+          $SOURCE_COMMIT = (git rev-parse HEAD).Trim()
+          "BUILD_VERSION=$GIT_VERSION" >> $env:GITHUB_ENV
+          "SOURCE_COMMIT=$SOURCE_COMMIT" >> $env:GITHUB_ENV
+
+          Write-Host "Num of Valid Tags = ${{ steps.valid-tags.outputs.count }}"
+          Write-Host "Test GitVer = ${{ inputs.version }} / $GIT_VERSION / $env:GITHUB_REF_NAME"
+
+          Set-Content -LiteralPath git-version.cpp -Value "const char *PPSSPP_GIT_VERSION = `"$GIT_VERSION`";" -Encoding utf8
+          Add-Content -LiteralPath git-version.cpp -Value "#define PPSSPP_GIT_VERSION_NO_UPDATE 1" -Encoding utf8
+
+          if ($GIT_VERSION.StartsWith("v")) {
+            $WIN_VERSION_COMMA = $GIT_VERSION -replace '^v', '' -replace '-g[0-9a-f]+$', '' -replace '[-\.]', ','
+            Write-Host "Test WinVer = $WIN_VERSION_COMMA"
+
+            Set-Content -LiteralPath Windows/win-version.h -Value "#define PPSSPP_WIN_VERSION_STRING `"$GIT_VERSION`"" -Encoding utf8
+            Add-Content -LiteralPath Windows/win-version.h -Value "#define PPSSPP_WIN_VERSION_COMMA $WIN_VERSION_COMMA" -Encoding utf8
+            Add-Content -LiteralPath Windows/win-version.h -Value "#define PPSSPP_WIN_VERSION_NO_UPDATE 1" -Encoding utf8
+          }
+
+      - name: Configure AVX2 compiler flags
+        shell: pwsh
+        run: |
+          $targets = @'
+          <Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+            <Target Name="PPSSPP_EnableAVX2"
+                    BeforeTargets="ClCompile"
+                    Condition="'$(Configuration)' == 'Release' and '$(Platform)' == 'x64' and '$(ProjectName)' != 'cpu_features'">
+              <ItemGroup>
+                <ClCompile>
+                  <AdditionalOptions>/arch:AVX2 %(ClCompile.AdditionalOptions)</AdditionalOptions>
+                </ClCompile>
+              </ItemGroup>
+            </Target>
+          </Project>
+          '@
+
+          Set-Content -LiteralPath "${{ runner.temp }}\ppsspp-avx2.targets" -Value $targets -Encoding utf8
+
+      - name: Build Windows Gold
+        shell: pwsh
+        run: |
+          msbuild Windows/PPSSPP.sln /m /p:TrackFileAccess=false "/p:Configuration=${{ env.BUILD_CONFIGURATION }}" "/p:Platform=${{ env.BUILD_PLATFORM }}" "/p:ForceImportAfterCppTargets=${{ runner.temp }}\ppsspp-avx2.targets" "/p:EXTERNAL_COMPILE_OPTIONS=/DGOLD" "/p:EXTERNAL_RC_DEFINITIONS=GOLD"
+
+      - name: Package Windows build
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path ppsspp -Force | Out-Null
+          Copy-Item PPSSPPWindows64.exe ppsspp/PPSSPPGoldWindows64.exe
+          Copy-Item PPSSPPWindows64.pdb ppsspp/PPSSPPGoldWindows64.pdb
+          Copy-Item Windows/*.bat ppsspp/
+          Copy-Item -Recurse assets ppsspp/assets
+
+          $zip = "PPSSPPGold-$env:BUILD_VERSION-Windows-x64.zip"
+          Compress-Archive -Path ppsspp/* -DestinationPath $zip -Force
+          "ZIP_NAME=$zip" >> $env:GITHUB_ENV
+
+      - name: Publish Windows Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: gold-build-${{ github.run_id }}-${{ github.run_attempt }}
+          name: PPSSPP Gold ${{ inputs.version }}-${{ env.SOURCE_COMMIT }}
+          body: |
+            Source repository: https://github.com/hrydgard/ppsspp
+            Requested ref: ${{ inputs.version }}
+            Source commit: ${{ env.SOURCE_COMMIT }}
+          files: ${{ env.ZIP_NAME }}
+          prerelease: ${{ inputs.version == 'master' || inputs.buildVariant == 'GoldDebug' }}
+          generate_release_notes: false
+          fail_on_unmatched_files: true
+
+  build-android:
+    name: Build Android arm64-v8a ${{ inputs.buildVariant }}
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout upstream source
+        uses: actions/checkout@v6
+        with:
+          repository: hrydgard/ppsspp
+          ref: ${{ inputs.version }}
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Fetch upstream tags if needed
+        shell: bash
+        run: |
+          if ! git tag -l 'v[0-9]*' | grep -q .; then
+            git remote add upstream https://github.com/hrydgard/ppsspp.git
+            git fetch --deepen=15000 --no-recurse-submodules --tags --force upstream || true
+          fi
+
+      - name: Get source commit
+        shell: bash
+        run: |
+          echo "SOURCE_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Setup JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Build Android APK
+        shell: bash
+        env:
+          VARIANT: ${{ inputs.buildVariant }}
+        run: |
+          set -e
+
+          ARGS=(
+            "-Pandroid.injected.build.abi=arm64-v8a"
+            "-Pandroid.injected.testOnly=false"
+            --stacktrace
+          )
+
+          if [[ "$VARIANT" == "GoldRelease" ]]; then
+            ARGS+=(
+              "-PRELEASE_STORE_FILE=debug.keystore"
+              "-PRELEASE_STORE_PASSWORD=android"
+              "-PRELEASE_KEY_ALIAS=androiddebugkey"
+              "-PRELEASE_KEY_PASSWORD=android"
+            )
+          fi
+
+          ./gradlew "assemble${VARIANT}" "${ARGS[@]}"
+
+      - name: Package and verify APK
+        shell: bash
+        env:
+          VARIANT: ${{ inputs.buildVariant }}
+        run: |
+          set -euo pipefail
+
+          APK=$(find android/build/intermediates/apk/gold -type f -name '*.apk' -print -quit)
+          test -n "$APK" || {
+            echo "::error::APK not found"
+            exit 1
+          }
+
+          unzip -l "$APK" | grep -q 'lib/arm64-v8a/' || {
+            echo "::error::arm64-v8a libraries not found"
+            exit 1
+          }
+
+          VERSION=$(cat android/versionname.txt 2>/dev/null || git describe --tags --always)
+          FILE="PPSSPPGold-${VERSION}-Android-arm64-v8a-${VARIANT}.apk"
+          cp "$APK" "$FILE"
+          echo "APK_NAME=$FILE" >> "$GITHUB_ENV"
+
+      - name: Publish Android Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: gold-build-${{ github.run_id }}-${{ github.run_attempt }}
+          name: PPSSPP Gold ${{ inputs.version }}-${{ env.SOURCE_COMMIT }}
+          body: |
+            Source repository: https://github.com/hrydgard/ppsspp
+            Requested ref: ${{ inputs.version }}
+            Source commit: ${{ env.SOURCE_COMMIT }}
+            Android variant: ${{ inputs.buildVariant }}
+          files: ${{ env.APK_NAME }}
+          prerelease: ${{ inputs.version == 'master' || inputs.buildVariant == 'GoldDebug' }}
+          generate_release_notes: false
+          fail_on_unmatched_files: true
